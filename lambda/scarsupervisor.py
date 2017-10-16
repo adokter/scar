@@ -187,8 +187,8 @@ def lambda_handler(event, context):
                 supervisor.relaunch_lambda(event=event, func_name=context.function_name)
                 print("WARNING: Container timeout")  
 
-        if stdout is not None:
-            stdout += check_output(["cat", lambda_output]).decode("utf-8")
+        #if stdout is not None:
+            #stdout += check_output(["cat", lambda_output]).decode("utf-8")
         supervisor.post_process(event, context)
 
     except Exception:
