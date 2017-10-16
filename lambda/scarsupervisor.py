@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 import boto3
 import json
 import os
@@ -28,6 +27,7 @@ class Supervisor():
     udocker_bin = "/tmp/udocker/udocker"
     container_name = "lambda_cont"
     s3_file_name = ""
+    s3_output_bucket = ""
     
     def prepare_environment(self, aws_request_id):
         # Install udocker in /tmp
@@ -107,11 +107,16 @@ class Supervisor():
         if(Utils().is_s3_event(event)):
             s3_record = Utils().get_s3_record(event)
             Supervisor.s3_file_name = S3_Bucket().download_input(s3_record, request_id)
+        if(Utils().is_sns_event(event)):
+            s3_record = Utils().get_sns_s3_record(event)
+            Supervisor.s3_file_name = S3_Bucket().download_input(s3_record, request_id)
     
     def post_process(self, event, context):
         request_id = context.aws_request_id
         if(Utils().is_s3_event(event)):
             S3_Bucket().upload_output(event['Records'][0]['s3'], request_id)
+        if(Utils().is_sns_event(event)):
+            S3_Bucket().upload_output(Utils().get_sns_s3_record(event), request_id)
         # Delete all the temporal folders created for the invocation
         call(["rm", "-rf", "/tmp/%s" % request_id])
                     
@@ -203,8 +208,26 @@ class Utils():
     def is_s3_event(self, event):
         if ('Records' in event) and event['Records']:
             # Check if the event is an S3 event
-            if event['Records'][0]['eventSource'] == "aws:s3":
-                return True
+            if 'eventSource' in event['Records'][0].keys():
+                if event['Records'][0]['eventSource'] == "aws:s3":
+                    return True
+                else:
+                    return False
+            else:
+                return False
+        else:
+            return False
+
+    def is_sns_event(self, event):
+        if ('Records' in event) and event['Records']:
+            # Check if the event is an SNS event
+            if 'EventSource' in event['Records'][0].keys():
+                if event['Records'][0]['EventSource'] == "aws:sns":
+                    return True
+                else:
+                    return False
+            else:
+                return False
         else:
             return False
     
@@ -215,6 +238,16 @@ class Utils():
             record = event['Records'][0]
             if('s3' in record) and record['s3']:
                 return record['s3']
+
+    def get_sns_s3_record(self, event):
+        if ('Records' in event) and event['Records']:
+            if len(event['Records']) > 1:
+                print("WARNING: MULTIPLE RECORDS DETECTED. ONLY PROCESSING THE FIRST ONE.")
+            record = event['Records'][0]
+            if('Sns' in record) and record['Sns']:
+                if('Message' in record['Sns']) and record['Sns']['Message']:
+                    sns_payload=json.loads(record['Sns']['Message'])
+                    return self.get_s3_record(sns_payload) 
 
 class S3_Bucket():
     
@@ -236,7 +269,10 @@ class S3_Bucket():
         return download_path
 
     def upload_output(self, s3_record, request_id):
-        bucket_name = self.get_bucket_name(s3_record)
+        if ('OUTPUT_BUCKET' in os.environ) and os.environ['OUTPUT_BUCKET']:
+            bucket_name = os.environ['OUTPUT_BUCKET']
+        else:
+            bucket_name = self.get_bucket_name(s3_record)
         output_folder = "/tmp/%s/output/" % request_id
         output_files_path = self.get_all_files_in_directory(output_folder)
         for file_path in output_files_path:
