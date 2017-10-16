@@ -240,7 +240,8 @@ class S3_Bucket():
         output_folder = "/tmp/%s/output/" % request_id
         output_files_path = self.get_all_files_in_directory(output_folder)
         for file_path in output_files_path:
-            file_key = "output/%s" % file_path.replace(output_folder, "")
+            file_basename = file_path.replace(output_folder, "")
+            file_key="output/"+file_basename[4:8]+"/"+file_basename[8:10]+"/"+file_basename[10:12]+"/"+file_basename[0:4]+"/"+file_basename
             print ("Uploading file to bucket %s with key %s" % (bucket_name, file_key))
             with open(file_path, 'rb') as data:
                 self.get_s3_client().upload_fileobj(data, bucket_name, file_key)
