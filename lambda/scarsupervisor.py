@@ -19,6 +19,8 @@ import re
 import signal
 from subprocess import call, check_output, Popen, STDOUT, TimeoutExpired
 import traceback
+from os.path import basename
+from datetime import datetime, timedelta
 
 print('Loading function')
 
@@ -96,6 +98,28 @@ class Supervisor():
         os.makedirs(event_file_path, exist_ok=True)     
         self.create_file(event, event_file_path + "/event.json")
     
+    def validate_event(self, event, context):
+        if ('NEXRAD' in os.environ) and os.environ['NEXRAD']:
+            if(Utils().is_sns_event(event)):
+                s3_record = Utils().get_sns_s3_record(event)
+                key = basename(s3_record['object']['key'])
+                datetime_min = datetime.utcnow() + timedelta(days=-7)
+                datetime_key = datetime.strptime(key[4:19], '%Y%m%d_%H%M%S')
+                if(key[0] != 'K'):
+                    print("SCAR: NEXRAD file of a radar outside USA, ignoring ...")
+                    return False
+                if(datetime_key < datetime_min):
+                    print("SCAR: NEXRAD file more than a week old, ignoring ...")
+                    return False
+                if(datetime_key.hour < 22 and datetime_key.hour > 14):
+                    print("SCAR: NEXRAD file daytime, ignoring ...")
+                    return False
+                return True
+            else:
+                return True
+        else:
+            return True
+ 
     def pre_process(self, event, context):
         self.create_event_file(json.dumps(event), context.aws_request_id)
         self.prepare_environment(context.aws_request_id)
@@ -140,7 +164,7 @@ class Supervisor():
             command.extend(global_variables)
     
         # Set the script executable 
-        script_exec = "/bin/sh"
+        script_exec = "/bin/bash"
         # Container running script
         script_path = "/tmp/%s/script.sh" % context.aws_request_id
         if ('script' in event) and event['script']:
@@ -173,28 +197,32 @@ def lambda_handler(event, context):
     supervisor = Supervisor()
     stdout = supervisor.prepare_output(context)
     try:
-        supervisor.pre_process(event, context)
-        # Create container execution command
-        command = supervisor.create_command(event, context)
-        # print ("Udocker command: %s" % command)
+        # check whether we accept the event
+        if supervisor.validate_event(event, context):
+            # pre_process the event
+            supervisor.pre_process(event, context)
+            # Create container execution command
+            command = supervisor.create_command(event, context)
+            # print ("Udocker command: %s" % command)
 
-        # Execute container
-        lambda_output = "/tmp/%s/lambda-stdout.txt" % context.aws_request_id
-        remaining_seconds = int(context.get_remaining_time_in_millis()/1000) - int(os.environ['TIME_THRESHOLD'])
-        print("Executing the container. Timeout set to %s seconds" % str(remaining_seconds))
-        with Popen(command, stderr=STDOUT, stdout=open(lambda_output, "w"), preexec_fn=os.setsid) as process:
-            try:
-                process.wait(timeout=remaining_seconds)
-            except TimeoutExpired:
-                print("SCAR: Stopping container with name '%s'." % (Supervisor.container_name))
-                # Using SIGKILL instead of SIGTERM to ensure the process finalization 
-                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-                supervisor.relaunch_lambda(event=event, func_name=context.function_name)
-                print("WARNING: Container timeout")  
-
-        #if stdout is not None:
-            #stdout += check_output(["cat", lambda_output]).decode("utf-8")
-        supervisor.post_process(event, context)
+            # Execute container
+            lambda_output = "/tmp/%s/lambda-stdout.txt" % context.aws_request_id
+            remaining_seconds = int(context.get_remaining_time_in_millis()/1000) - int(os.environ['TIME_THRESHOLD'])
+            print("Executing the container. Timeout set to %s seconds" % str(remaining_seconds))
+            with Popen(command, stderr=STDOUT, stdout=open(lambda_output, "w"), preexec_fn=os.setsid) as process:
+                try:
+                    process.wait(timeout=remaining_seconds)
+                except TimeoutExpired:
+                    print("SCAR: Stopping container with name '%s'." % (Supervisor.container_name))
+                    # Using SIGKILL instead of SIGTERM to ensure the process finalization 
+                    os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                    supervisor.relaunch_lambda(event=event, func_name=context.function_name)
+                    print("WARNING: Container timeout")  
+            #if stdout is not None:
+            #   stdout += check_output(["cat", lambda_output]).decode("utf-8")
+            supervisor.post_process(event, context)
+        else:
+            print("Ignoring this event")
 
     except Exception:
         if stdout is None:
@@ -277,7 +305,10 @@ class S3_Bucket():
         output_files_path = self.get_all_files_in_directory(output_folder)
         for file_path in output_files_path:
             file_basename = file_path.replace(output_folder, "")
-            file_key="output/"+file_basename[4:8]+"/"+file_basename[8:10]+"/"+file_basename[10:12]+"/"+file_basename[0:4]+"/"+file_basename
+            if ('NEXRAD' in os.environ) and os.environ['NEXRAD']:
+                file_key="output/"+file_basename[4:8]+"/"+file_basename[8:10]+"/"+file_basename[10:12]+"/"+file_basename[0:4]+"/"+file_basename
+            else:
+                file_key="output/"+file_basename 
             print ("Uploading file to bucket %s with key %s" % (bucket_name, file_key))
             with open(file_path, 'rb') as data:
                 self.get_s3_client().upload_fileobj(data, bucket_name, file_key)
