@@ -56,22 +56,18 @@ class Scar(object):
         aws_client.check_function_name_exists(Config.lambda_name, (True if args.verbose or args.json else False))
         # Set the rest of the parameters
         Config.lambda_handler = Config.lambda_name + ".lambda_handler"
-        if args.script:
-            Config.lambda_zip_file = {"ZipFile": self.create_zip_file(Config.lambda_name, args.script)}
-            Config.lambda_env_variables['Variables']['INIT_SCRIPT_PATH'] = "/var/task/init_script.sh"
-        else:
-            Config.lambda_zip_file = {"ZipFile": self.create_zip_file(Config.lambda_name)}
-        if args.memory:
+        Config.lambda_zip_file = {"ZipFile": self.create_zip_file(Config.lambda_name, args)}
+        if hasattr(args, 'memory') and args.memory:
             Config.lambda_memory = aws_client.check_memory(args.memory)
-        if args.time:
+        if hasattr(args, 'time') and args.time:
             Config.lambda_time = aws_client.check_time(args.time)
-        if args.description:
+        if hasattr(args, 'description') and args.description:
             Config.lambda_description = args.description
-        if args.image_id:
+        if hasattr(args, 'image_id') and args.image_id:
             Config.lambda_env_variables['Variables']['IMAGE_ID'] = args.image_id
-        if args.lambda_role:
+        if hasattr(args, 'lambda_role') and args.lambda_role:
             Config.lambda_role = args.lambda_role
-        if args.time_threshold:
+        if hasattr(args, 'time_threshold') and args.time_threshold:
             Config.lambda_env_variables['Variables']['TIME_THRESHOLD'] = str(args.time_threshold)
         else:
             Config.lambda_env_variables['Variables']['TIME_THRESHOLD'] = str(Config.lambda_timeout_threshold)
@@ -81,8 +77,10 @@ class Scar(object):
             Config.lambda_env_variables['Variables']['OUTPUT_BUCKET'] = args.output_bucket
         if args.nexrad:
             Config.lambda_env_variables['Variables']['NEXRAD'] = str(True)
+        if hasattr(args, 'recursive') and args.recursive:
+            Config.lambda_env_variables['Variables']['RECURSIVE'] = str(True)
         # Modify environment vars if necessary
-        if args.env:
+        if hasattr(args, 'env') and args.env:
             StringUtils().parse_environment_variables(args.env)
         # Update lambda tags
         Config.lambda_tags['owner'] = aws_client.get_user_name_or_id()
@@ -116,7 +114,7 @@ class Scar(object):
             sys.exit(1)
         finally:
             # Remove the zip created in the operation
-            os.remove(Config.zif_file_path)
+            os.remove(Config.zip_file_path)
 
         # Create log group
         log_group_name = '/aws/lambda/' + Config.lambda_name
@@ -145,16 +143,27 @@ class Scar(object):
             print ("Error setting log retention policy: %s" % ce)
 
         # Add even source to lambda function
-        if args.event_source:
+        if hasattr(args, 'event_source') and args.event_source:
+            bucket_name = args.event_source
             try:
-                aws_client.check_and_create_s3_bucket(args.event_source)
-                aws_client.add_lambda_permissions(args.event_source)
-                aws_client.create_trigger_from_bucket(args.event_source, function_arn)
+                aws_client.check_and_create_s3_bucket(bucket_name)
+                aws_client.add_lambda_permissions(bucket_name)
+                aws_client.create_trigger_from_bucket(bucket_name, function_arn)
+                if args.recursive:
+                    aws_client.add_s3_bucket_folder(bucket_name, "recursive/")
+                    aws_client.create_recursive_trigger_from_bucket(bucket_name, function_arn)
             except ClientError as ce:
                 print ("Error creating the event source: %s" % ce)
+                print ("Deleting all the resources created.")
+                aws_client.delete_resources(Config.lambda_name, args.json, args.verbose)
+                sys.exit(1)
 
         # Show results
         result.print_results(json=args.json, verbose=args.verbose)
+
+        # If preheat is activated, the function is launched at the init step
+        if hasattr(args, 'preheat') and args.preheat:
+            aws_client.preheat_function(aws_client, args)
 
     def ls(self, args):
         try:
@@ -195,36 +204,36 @@ class Scar(object):
         # Set call parameters
         invocation_type = 'RequestResponse'
         log_type = 'Tail'
-        if args.async:
+        if hasattr(args, 'async') and args.async:
             invocation_type = 'Event'
             log_type = 'None'
         # Modify memory if necessary
-        if args.memory:
+        if hasattr(args, 'memory') and args.memory:
             aws_client.update_function_memory(args.name, args.memory)
         # Modify timeout if necessary
-        if args.time:
+        if hasattr(args, 'time') and args.time:
             aws_client.update_function_timeout(args.name, args.time)
         # Modify environment vars if necessary
-        if args.env:
+        if hasattr(args, 'env') and args.env:
             aws_client.update_function_env_variables(args.name, args.env)
-            
         payload = {}
         # Parse the function script
-        if args.script:
+        if hasattr(args, 'script') and args.script:
             payload = { "script" : StringUtils().escape_string(args.script.read()) }
         # Or parse the container arguments
-        elif args.cont_args:
+        elif hasattr(args, 'cont_args') and args.cont_args:
             payload = { "cmd_args" : StringUtils().escape_list(args.cont_args) }
 
         # Use the event source to launch the function
-        if args.event_source:
+        if hasattr(args, 'event_source') and args.event_source:
+            log_type = 'None'
             event = Config.lambda_event
             event['Records'][0]['s3']['bucket']['name'] = args.event_source
             s3_files = aws_client.get_s3_file_list(args.event_source)
             print("Files found: '%s'" % s3_files)
 
             if len(s3_files) >= 1:
-                self.launch_request_response_event(s3_files[0], event, aws_client, args)
+                aws_client.launch_request_response_event(s3_files[0], event, aws_client, args)
 
             if len(s3_files) > 1:
                 s3_files = s3_files[1:]
@@ -232,89 +241,23 @@ class Scar(object):
 
                 chunk_size = 1000
                 if size > chunk_size:
-                    s3_file_chunks = self.chunks(s3_files, chunk_size)
+                    s3_file_chunks = self.divide_list_in_chunks(s3_files, chunk_size)
                     for s3_file_chunk in s3_file_chunks:
                         pool = ThreadPool(processes=len(s3_file_chunk))
                         pool.map(
-                            lambda s3_file: self.launch_async_event(s3_file, event, aws_client, args),
+                            lambda s3_file: aws_client.launch_async_event(s3_file, event, aws_client, args),
                             s3_file_chunk
                         )
                         pool.close()
                 else:
                     pool = ThreadPool(processes=len(s3_files))
                     pool.map(
-                        lambda s3_file: self.launch_async_event(s3_file, event, aws_client, args),
+                        lambda s3_file: aws_client.launch_async_event(s3_file, event, aws_client, args),
                         s3_files
                     )
                     pool.close()
         else:
-            response = aws_client.invoke_function(args.name, invocation_type, log_type, json.dumps(payload))
-            self.parse_run_response(response, args.name, args.async, args.json, args.verbose)
-
-    def chunks(self, elements, chunk_size):
-        """Yield successive n-sized chunks from list."""
-        if len(elements) == 0:
-            yield []
-        for i in range(0, len(elements), chunk_size):
-            yield elements[i:i + chunk_size]
-
-    def launch_generic_event(self, s3_file, event, aws_client, args, async, invocation_type, log_type):
-        event['Records'][0]['s3']['object']['key'] = s3_file
-        payload = json.dumps(event)
-        print("Sending event for file '%s'" % s3_file)
-        response = aws_client.invoke_function(args.name, invocation_type, log_type, payload)
-        self.parse_run_response(response, args.name, async, args.json, args.verbose)
-
-    def launch_request_response_event(self, s3_file, event, aws_client, args):
-        self.launch_generic_event(s3_file, event, aws_client, args, False, 'RequestResponse', 'Tail')
-
-    def launch_async_event(self, s3_file, event, aws_client, args):
-        self.launch_generic_event(s3_file, event, aws_client, args, True, 'Event', 'None')
-
-    def parse_run_response(self, response, function_name, async, json, verbose):
-        # Decode and parse the payload
-        response = StringUtils().parse_payload(response)
-        if "FunctionError" in response:
-            if "Task timed out" in response['Payload']:
-                # Find the timeout time
-                message = StringUtils().find_expression('(Task timed out .* seconds)', str(response['Payload']))
-                # Modify the error message
-                message = message.replace("Task", "Function '%s'" % function_name)
-                if verbose or json:
-                    StringUtils().print_json({"Error" : message})
-                else:
-                    print ("Error: %s" % message)
-            else:
-                print ("Error in function response: %s" % response['Payload'])
-            sys.exit(1)
-
-
-        result = Result()
-        if async:
-            # Prepare the outputs
-            result.append_to_verbose('LambdaOutput', response)
-            result.append_to_json('LambdaOutput', {'StatusCode' : response['StatusCode'],
-                                                       'RequestId' : response['ResponseMetadata']['RequestId']})
-            result.append_to_plain_text("Function '%s' launched correctly" % function_name)
-
-        else:
-            # Transform the base64 encoded results to something legible
-            response = StringUtils().parse_base64_response_values(response)
-            # Extract log_group_name and log_stream_name from the payload
-            response = StringUtils().parse_log_ids(response)
-            # Prepare the outputs
-            result.append_to_verbose('LambdaOutput', response)
-            result.append_to_json('LambdaOutput', {'StatusCode' : response['StatusCode'],
-                                                   'Payload' : response['Payload'],
-                                                   'LogGroupName' : response['LogGroupName'],
-                                                   'LogStreamName' : response['LogStreamName'],
-                                                   'RequestId' : response['ResponseMetadata']['RequestId']})
-
-            result.append_to_plain_text('SCAR: Request Id: %s' % response['ResponseMetadata']['RequestId'])
-            result.append_to_plain_text(response['Payload'])
-
-        # Show results
-        result.print_results(json=json, verbose=verbose)
+            aws_client.launch_lambda_instance(aws_client, args, invocation_type, log_type, json.dumps(payload))
 
     def rm(self, args):
         aws_client = self.get_aws_client()
@@ -325,33 +268,13 @@ class Scar(object):
         else:
             aws_client.delete_resources(args.name, args.json, args.verbose)
 
-    def create_zip_file(self, file_name, script_path=None):
-        # Set generic lambda function name
-        function_name = file_name + '.py'
-        # Copy file to avoid messing with the repo files
-        # We have to rename because the function name afects the handler name
-        shutil.copy(Config.dir_path + '/lambda/scarsupervisor.py', function_name)
-        # Zip the function file
-        with zipfile.ZipFile(Config.zif_file_path, 'w') as zf:
-            # Lambda function code
-            zf.write(function_name)
-            # Udocker script code
-            zf.write(Config.dir_path + '/lambda/udocker', 'udocker')
-            # Udocker libs
-            zf.write(Config.dir_path + '/lambda/udocker-1.1.0-RC2.tar.gz', 'udocker-1.1.0-RC2.tar.gz')
-            os.remove(function_name)
-            if script_path:
-                zf.write(script_path, 'init_script.sh')
-        # Return the zip as an array of bytes
-        with open(Config.zif_file_path, 'rb') as f:
-            return f.read()
-
     def log(self, args):
         try:
+            aws_client = self.get_aws_client()
             log_group_name = "/aws/lambda/%s" % args.name
             full_msg = ""
             if args.log_stream_name:
-                response = self.get_aws_client().get_log().get_log_events(
+                response = aws_client.get_log().get_log_events(
                     logGroupName=log_group_name,
                     logStreamName=args.log_stream_name,
                     startFromHead=True
@@ -359,14 +282,14 @@ class Scar(object):
                 for event in response['events']:
                     full_msg += event['message']
             else:
-                response = self.get_aws_client().get_log().filter_log_events(logGroupName=log_group_name)
+                response = aws_client.get_log().filter_log_events(logGroupName=log_group_name)
                 data = []
 
                 for event in response['events']:
                     data.append((event['message'], event['timestamp']))
 
                 while(('nextToken' in response) and response['nextToken']):
-                    response = self.get_aws_client().get_log().filter_log_events(logGroupName=log_group_name,
+                    response = aws_client.get_log().filter_log_events(logGroupName=log_group_name,
                                                                                  nextToken=response['nextToken'])
                     for event in response['events']:
                         data.append((event['message'], event['timestamp']))
@@ -402,6 +325,46 @@ class Scar(object):
 
     def get_aws_client(self):
         return AwsClient()
+    
+    def divide_list_in_chunks(self, elements, chunk_size):
+        """Yield successive n-sized chunks from th elements list."""
+        if len(elements) == 0:
+            yield []
+        for i in range(0, len(elements), chunk_size):
+            yield elements[i:i + chunk_size]
+
+    def create_zip_file(self, file_name, args):
+        # Set generic lambda function name
+        function_name = file_name + '.py'
+        # Copy file to avoid messing with the repo files
+        # We have to rename because the function name afects the handler name
+        shutil.copy(Config.dir_path + '/lambda/scarsupervisor.py', function_name)
+        # Zip the function file
+        with zipfile.ZipFile(Config.zip_file_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+            # Lambda function code
+            zf.write(function_name)
+            # Udocker script code
+            zf.write(Config.dir_path + '/lambda/udocker', 'udocker')
+            # Udocker libs
+            zf.write(Config.dir_path + '/lambda/udocker-1.1.0-RC2.tar.gz', 'udocker-1.1.0-RC2.tar.gz')
+            os.remove(function_name)
+            if hasattr(args, 'script') and args.script:
+                zf.write(args.script, 'init_script.sh')
+                Config.lambda_env_variables['Variables']['INIT_SCRIPT_PATH'] = "/var/task/init_script.sh"
+        if hasattr(args, 'extra_payload') and args.extra_payload:
+            self.zipfolder(Config.zip_file_path, args.extra_payload)
+            Config.lambda_env_variables['Variables']['EXTRA_PAYLOAD'] = "/var/task/extra/"
+        # Return the zip as an array of bytes
+        with open(Config.zip_file_path, 'rb') as f:
+            return f.read()
+        
+    def zipfolder(self, zipPath, target_dir):            
+        with zipfile.ZipFile(zipPath, 'a', zipfile.ZIP_DEFLATED) as zf:
+            rootlen = len(target_dir) + 1
+            for base, _, files in os.walk(target_dir):
+                for file in files:
+                    fn = os.path.join(base, file)
+                    zf.write(fn, 'extra/' + fn[rootlen:])        
 
 class StringUtils(object):
 
@@ -497,7 +460,7 @@ class Config(object):
 
     dir_path = os.path.dirname(os.path.realpath(__file__))
 
-    zif_file_path = dir_path + '/function.zip'
+    zip_file_path = dir_path + '/function.zip'
 
     config_parser = configparser.ConfigParser()
 
@@ -661,10 +624,11 @@ class AwsClient(object):
         except ClientError as ce:
             print ("Error updating the environment variables of the lambda function: %s" % ce)
 
+    
+    
     def create_trigger_from_bucket(self, bucket_name, function_arn):
         notification = { "LambdaFunctionConfigurations": [
-                            { "Id": "string",
-                              "LambdaFunctionArn": function_arn,
+                            { "LambdaFunctionArn": function_arn,
                               "Events": [ "s3:ObjectCreated:*" ],
                               "Filter":
                                 { "Key":
@@ -679,9 +643,40 @@ class AwsClient(object):
         try:
             self.get_s3().put_bucket_notification_configuration( Bucket=bucket_name,
                                                                  NotificationConfiguration=notification )
-
         except ClientError as ce:
             print ("Error configuring S3 bucket: %s" % ce)
+            
+    def create_recursive_trigger_from_bucket(self, bucket_name, function_arn):
+        notification = { "LambdaFunctionConfigurations": [
+                            { "LambdaFunctionArn": function_arn,
+                              "Events": [ "s3:ObjectCreated:*" ],
+                              "Filter":
+                                { "Key":
+                                    { "FilterRules": [
+                                        { "Name": "prefix",
+                                          "Value": "input/"
+                                        }]
+                                    }
+                                }
+                            },
+                            { "LambdaFunctionArn": function_arn,
+                              "Events": [ "s3:ObjectCreated:*" ],
+                              "Filter":
+                                { "Key":
+                                    { "FilterRules": [
+                                        { "Name": "prefix",
+                                          "Value": "recursive/"
+                                        }]
+                                    }
+                                }
+                            }]
+                        }
+        try:
+            self.get_s3().put_bucket_notification_configuration( Bucket=bucket_name,
+                                                                 NotificationConfiguration=notification )
+
+        except ClientError as ce:
+            print ("Error configuring S3 bucket: %s" % ce)            
 
     def add_lambda_permissions(self, bucket_name):
         try:
@@ -694,31 +689,37 @@ class AwsClient(object):
         except ClientError as ce:
             print ("Error setting lambda permissions: %s" % ce)
 
-    def check_and_create_s3_bucket(self, bucket_name):
+    def find_s3_bucket(self, bucket_name):
         try:
-            buckets = self.get_s3().list_buckets()
             # Search for the bucket
-            found_bucket = [bucket for bucket in buckets['Buckets'] if bucket['Name'] == bucket_name]
-            if not found_bucket:
-                # Create the bucket if not found
-                self.create_s3_bucket(bucket_name)
-            # Add folder structure
-            self.add_s3_bucket_folders(bucket_name)
+            buckets = self.get_s3().list_buckets()
+            return [bucket for bucket in buckets['Buckets'] if bucket['Name'] == bucket_name]            
         except ClientError as ce:
-            print ("Error getting the S3 buckets list: %s" % ce)
+            print ("Error getting the S3 buckets list: %s" % ce)    
+            raise
 
     def create_s3_bucket(self, bucket_name):
         try:
             self.get_s3().create_bucket(ACL='private', Bucket=bucket_name)
         except ClientError as ce:
             print ("Error creating the S3 bucket '%s': %s" % (bucket_name, ce))
+            raise            
 
-    def add_s3_bucket_folders(self, bucket_name):
+    def add_s3_bucket_folder(self, bucket_name, folder_name):
         try:
-            self.get_s3().put_object(Bucket=bucket_name, Key="input/")
-            self.get_s3().put_object(Bucket=bucket_name, Key="output/")
+            self.get_s3().put_object(Bucket=bucket_name, Key=folder_name)
         except ClientError as ce:
             print ("Error creating the S3 bucket '%s' folders: %s" % (bucket_name, ce))
+            raise            
+
+    def check_and_create_s3_bucket(self, bucket_name):
+        found_bucket = self.find_s3_bucket(bucket_name)         
+        if not found_bucket:
+            # Create the bucket if not found
+            self.create_s3_bucket(bucket_name)
+        # Add folder structure
+        self.add_s3_bucket_folder(bucket_name, "input/")
+        self.add_s3_bucket_folder(bucket_name, "output/")
 
     def get_functions_arn_list(self):
         arn_list = []
@@ -806,6 +807,80 @@ class AwsClient(object):
             sys.exit(1)
         return response
 
+    def preheat_function(self, aws_client, args):
+        args.async = False
+        self.launch_lambda_instance(aws_client, args, 'RequestResponse', 'Tail', "")
+
+    def launch_async_event(self, s3_file, event, aws_client, args):
+        args.async = True
+        self.launch_event(s3_file, event, aws_client, args, 'Event', 'None')
+        
+    def launch_request_response_event(self, s3_file, event, aws_client, args):
+        args.async = False
+        self.launch_event(s3_file, event, aws_client, args, 'RequestResponse', 'Tail')        
+
+    def launch_event(self, s3_file, event, aws_client, args, invocation_type, log_type):
+        event['Records'][0]['s3']['object']['key'] = s3_file
+        payload = json.dumps(event)
+        print("Sending event for file '%s'" % s3_file)
+        self.launch_lambda_instance(aws_client, args, invocation_type, log_type, payload)
+
+    def launch_lambda_instance(self, aws_client, args, invocation_type, log_type, payload):
+        '''
+        aws_client: generic AwsClient
+        args: function arguments generated by the CmdParser
+        invocation_type: RequestResponse' or 'Event'
+        log_type: 'Tail' or 'None', related with the previous parameter
+        payload: json formated string (e.g. json.dumps(data))
+        '''
+        response = aws_client.invoke_function(args.name, invocation_type, log_type, payload)
+        self.parse_response(response, args.name, args.async, args.json, args.verbose)
+
+    def parse_response(self, response, function_name, async, json, verbose):
+        # Decode and parse the payload
+        response = StringUtils().parse_payload(response)
+        if "FunctionError" in response:
+            if "Task timed out" in response['Payload']:
+                # Find the timeout time
+                message = StringUtils().find_expression('(Task timed out .* seconds)', str(response['Payload']))
+                # Modify the error message
+                message = message.replace("Task", "Function '%s'" % function_name)
+                if verbose or json:
+                    StringUtils().print_json({"Error" : message})
+                else:
+                    print ("Error: %s" % message)
+            else:
+                print ("Error in function response: %s" % response['Payload'])
+            sys.exit(1)
+
+
+        result = Result()
+        if async:
+            # Prepare the outputs
+            result.append_to_verbose('LambdaOutput', response)
+            result.append_to_json('LambdaOutput', {'StatusCode' : response['StatusCode'],
+                                                       'RequestId' : response['ResponseMetadata']['RequestId']})
+            result.append_to_plain_text("Function '%s' launched correctly" % function_name)
+
+        else:
+            # Transform the base64 encoded results to something legible
+            response = StringUtils().parse_base64_response_values(response)
+            # Extract log_group_name and log_stream_name from the payload
+            response = StringUtils().parse_log_ids(response)
+            # Prepare the outputs
+            result.append_to_verbose('LambdaOutput', response)
+            result.append_to_json('LambdaOutput', {'StatusCode' : response['StatusCode'],
+                                                   'Payload' : response['Payload'],
+                                                   'LogGroupName' : response['LogGroupName'],
+                                                   'LogStreamName' : response['LogStreamName'],
+                                                   'RequestId' : response['ResponseMetadata']['RequestId']})
+
+            result.append_to_plain_text('SCAR: Request Id: %s' % response['ResponseMetadata']['RequestId'])
+            result.append_to_plain_text(response['Payload'])
+
+        # Show results
+        result.print_results(json=json, verbose=verbose)
+
 class Result(object):
 
     def __init__(self):
@@ -888,6 +963,8 @@ class CmdParser(object):
         parser_init.add_argument("-o", "--output_bucket", help="Name specifying the bucket containing /output key in which output is stored. If omitted, same bucket that triggered the event, see --event_source.")
         parser_init.add_argument("-lr", "--lambda_role", help="Lambda role used in the management of the functions")
         parser_init.add_argument("-r", "--recursive", help="Launch a recursive lambda function", action="store_true")
+        parser_init.add_argument("-p", "--preheat", help="Preheats the function running it once and downloading the necessary container", action="store_true")
+        parser_init.add_argument("-ep", "--extra_payload", help="Folder containing files that are going to be added to the payload of the lambda function")
 
         # 'ls' command
         parser_ls = subparsers.add_parser('ls', help="List lambda functions")
