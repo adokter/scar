@@ -43,21 +43,21 @@ logger.info('SCAR: Loading lambda function')
 #        S3 RELATED FUNCTIONS         #
 #######################################
 
-def is_s3_event(self, event):
+def is_s3_event(event):
     if check_key_existence_in_dictionary('Records', event):
         # Check if the event is an S3 event
         if 'eventSource' in event['Records'][0].keys():
-            return event['Records'][0]['eventSource'] == "aws:s3":
+            return event['Records'][0]['eventSource'] == "aws:s3"
         else:
             return False
     else:
         return False
 
-def is_sns_event(self, event):
+def is_sns_event(event):
     if check_key_existence_in_dictionary('Records', event):
         # Check if the event is an SNS event
         if 'EventSource' in event['Records'][0].keys():
-            return event['Records'][0]['EventSource'] == "aws:sns":
+            return event['Records'][0]['EventSource'] == "aws:sns"
         else:
             return False
     else:
@@ -71,7 +71,7 @@ def get_s3_record(event):
         if check_key_existence_in_dictionary('s3', record):
             return record['s3']    
 
-def get_sns_s3_record(self, event):
+def get_sns_s3_record(event):
     if check_key_existence_in_dictionary('Records', event):
         if len(event['Records']) > 1:
             print("WARNING: MULTIPLE RECORDS DETECTED. ONLY PROCESSING THE FIRST ONE.")
@@ -79,7 +79,7 @@ def get_sns_s3_record(self, event):
         if('Sns' in record) and record['Sns']:
             if('Message' in record['Sns']) and record['Sns']['Message']:
                 sns_payload=json.loads(record['Sns']['Message'])
-                return self.get_s3_record(sns_payload) 
+                return get_s3_record(sns_payload) 
  
 def get_s3_client():
     return boto3.client('s3')
@@ -113,15 +113,19 @@ def delete_file_from_s3(s3_record):
     file_key = get_s3_file_key(s3_record)
     get_s3_client().delete_object(Bucket=bucket_name, Key=file_key)
 
+
 def upload_output_to_s3(s3_record):
-    bucket_name = get_s3_bucket_name(s3_record)
+    if ('OUTPUT_BUCKET' in os.environ) and os.environ['OUTPUT_BUCKET']:
+        bucket_name = os.environ['OUTPUT_BUCKET']
+    else:
+        bucket_name = get_s3_bucket_name(s3_record)
+
     output_files_path = get_all_files_in_directory(output_folder)
     for file_path in output_files_path:
-
-
         file_basename = file_path.replace(output_folder, "")
         if ('NEXRAD' in os.environ) and os.environ['NEXRAD']:
-            file_key="output/"+file_basename[4:8]+"/"+file_basename[8:10]+"/"+file_basename[10:12]+"/"+file_basename[0:4]+"/"+file_basename
+            # note: file_basename has a leading slash
+            file_key="output/"+file_basename[5:9]+"/"+file_basename[9:11]+"/"+file_basename[11:13]+"/"+file_basename[1:5]+file_basename
         else:
             file_key="output/"+file_basename 
         upload_file_to_s3(bucket_name, file_path, file_key) 
@@ -169,7 +173,7 @@ def create_event_file(file_content):
     os.makedirs(event_file_path, exist_ok=True)     
     create_file_with_content(event_file_path + "/event.json", file_content)
     
-def validate_event(self, event, context):
+def validate_event(event, context):
     if ('NEXRAD' in os.environ) and os.environ['NEXRAD']:
         if(is_sns_event(event)):
             s3_record = get_sns_s3_record(event)
@@ -198,15 +202,15 @@ def pre_process(event):
     check_s3_event_records(event)
     
 def check_s3_event_records(event):
+    global s3_input_file_name
     if(is_s3_event(event)):
         s3_record = get_s3_record(event)
         if s3_record:
-            global s3_input_file_name
             s3_input_file_name = download_input_from_s3(s3_record)
-     if(is_sns_event(event)):
+    if(is_sns_event(event)):
         s3_record = get_sns_s3_record(event)
         if s3_record:
-            global s3_input_file_name
+    #        global s3_input_file_name
             s3_input_file_name = download_input_from_s3(s3_record)
  
 def post_process(event):
@@ -375,7 +379,7 @@ def launch_udocker_container(event, context, command):
 
 def read_udocker_output_file(output_file_path):
     with open(output_file_path, 'r') as content_file:
-        return content_file.read()    
+        return content_file.read()
 
 #######################################
 #           USEFUL FUNCTIONS          #
@@ -423,14 +427,15 @@ def lambda_handler(event, context):
     stdout = ""
     stdout += prepare_output(context)
     try:
-        pre_process(event)
-        # Create container execution command
-        command = create_udocker_command(event)
-        logger.debug("Udocker command: %s" % command)
-        # Execute container
-        output_file_path = launch_udocker_container(event, context, command)                                       
-        stdout += read_udocker_output_file(output_file_path)
-        post_process(event)
+        if validate_event(event,context):
+            pre_process(event)
+            # Create container execution command
+            command = create_udocker_command(event)
+            logger.debug("Udocker command: %s" % command)
+            # Execute container
+            output_file_path = launch_udocker_container(event, context, command)                                       
+            # hack! ignoring because of utf8 decoding error.    stdout += read_udocker_output_file(output_file_path)
+            post_process(event)
    
     except Exception:
         logger.error("Exception launched:\n %s" % traceback.format_exc())
