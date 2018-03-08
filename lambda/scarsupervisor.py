@@ -186,7 +186,7 @@ def validate_event(event, context):
             if(datetime_key < datetime_min):
                 print("SCAR: NEXRAD file more than a week old, ignoring ...")
                 return False
-            if(datetime_key.hour < 22 and datetime_key.hour > 14):
+            if(datetime_key.hour < 22 and datetime_key.hour > 16):
                 print("SCAR: NEXRAD file daytime, ignoring ...")
                 return False
             return True

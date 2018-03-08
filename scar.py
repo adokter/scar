@@ -1,4 +1,4 @@
-#! /usr/bin/python
+#!/usr/bin/python
 
 # SCAR - Serverless Container-aware ARchitectures
 # Copyright (C) GRyCAP - I3M - UPV
